@@ -2,7 +2,7 @@
 # Seekter installer for macOS and Linux (Debian/Ubuntu).
 #
 # One line, pasted into Terminal:
-#   curl -fsSL https://raw.githubusercontent.com/selfishprimate/seekter/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/prashanthyarramreddy/seekter/main/scripts/install.sh | bash
 #
 # Safe to run again: everything already installed is checked, updated where it can be,
 # and left alone otherwise. `--check` only reports what is missing and changes nothing.
@@ -19,7 +19,7 @@
 
 set -u
 
-REPO_URL="https://github.com/selfishprimate/seekter.git"
+REPO_URL="${SEEKTER_REPO:-https://github.com/prashanthyarramreddy/seekter.git}"
 SEEKTER_DIR="${SEEKTER_DIR:-$HOME/seekter}"
 EXT_ID="fcoeoabgfenejglbffodgkkbkcdhcgfn"
 EXT_URL="https://chromewebstore.google.com/detail/claude/$EXT_ID"

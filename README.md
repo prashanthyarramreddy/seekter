@@ -23,7 +23,7 @@ Why it exists, and the principles it is built on, are in [MANIFESTO.md](MANIFEST
 New to the terminal? On macOS or Linux, paste this one line into Terminal. It checks and installs everything below (Chrome, Claude Code, sign-in, the Chrome extension, Seekter itself) and is safe to run again. To only see what is missing, end the line with `| bash -s -- --check` instead:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/selfishprimate/seekter/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/prashanthyarramreddy/seekter/main/scripts/install.sh | bash
 ```
 
 Or by hand:
