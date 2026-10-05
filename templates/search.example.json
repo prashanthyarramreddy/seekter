@@ -13,6 +13,7 @@
     "categories": [],
     "regions": ["global", "eu", "emea", "europe"],
     "home_country": "",
+    "_window": "How old a posting may be. window_days counts whole days (3 = up to 95 hours); window_hours, when set, is exact and wins. freehire imports in batches, so a posting can arrive already a day old: keep the window at least 48 hours even when scanning more than once a day; dedup absorbs the overlap.",
     "window_days": 3
   },
   "linkedin": {

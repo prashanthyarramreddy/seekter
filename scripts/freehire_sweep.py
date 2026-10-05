@@ -58,6 +58,9 @@ def sweep():
     drop = re.compile(CFG["title_drop"] or r"(?!)", re.I)  # empty regex matches everything; (?!) matches nothing
     blocked_domains = set(CFG.get("blocked_domains", ["gambling"]))
     langs = set(CFG.get("languages", ["en"]))
+    # window_hours is exact; window_days counts whole days (age.days, rounded down), so
+    # window_days 2 still lets a 71-hour-old posting through. Hours win when both are set.
+    window_h = float(FH["window_hours"]) if FH.get("window_hours") else None
     window = int(FH.get("window_days", 3))
     tracked = {r.get("job_key") for r in seekter.all_apps()}
     now = dt.datetime.now(dt.timezone.utc)
@@ -74,10 +77,11 @@ def sweep():
         if not keep.search(t) or drop.search(t):
             stats["title"] += 1; continue
         try:
-            age = (now - dt.datetime.fromisoformat((j.get("posted_at") or j.get("created_at")).replace("Z", "+00:00"))).days
+            delta = now - dt.datetime.fromisoformat((j.get("posted_at") or j.get("created_at")).replace("Z", "+00:00"))
+            age, age_h = delta.days, delta.total_seconds() / 3600
         except Exception:
-            age = 99
-        if age > window:
+            age, age_h = 99, 99 * 24.0
+        if (age_h > window_h) if window_h is not None else (age > window):
             stats["stale"] += 1; continue
         url = re.sub(r"[?&]utm_[^&]*", "", j.get("url") or "")
         if "?" not in url:
