@@ -91,6 +91,20 @@ class JobKeyTests(unittest.TestCase):
         self.assertEqual(one, "careers.example.com:1234567")
         self.assertNotEqual(one, two)
 
+    def test_adp_postings_key_on_tenant_and_job_id(self):
+        # Measured 4 Oct: two ADP postings from different companies shared one path
+        # and ccId, and jobId's "_1" suffix slipped past the digits-only rule.
+        base = "https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html?ccId=19000101_000001"
+        one = sk.job_key(base + "&cid=AAA-111&jobId=9202885037285_1&lang=en_US")
+        two = sk.job_key(base + "&cid=BBB-222&jobId=397270794_1&lang=en_US")
+        self.assertEqual(one, "adp:aaa-111:9202885037285_1")
+        self.assertNotEqual(one, two)
+        # A record stored with the old shared-path key is re-keyed by normalize.
+        r = dict(url=base + "&cid=AAA-111&jobId=9202885037285_1",
+                 job_key="workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html")
+        sk.fix_meta(r)
+        self.assertEqual(r["job_key"], one)
+
     def test_apply_suffix_and_www_do_not_create_a_second_record(self):
         plain = sk.job_key("https://www.example.com/careers/senior-designer")
         applying = sk.job_key("https://example.com/careers/senior-designer/apply")

@@ -49,6 +49,13 @@ def job_key(url: str) -> str:
             return f"greenhouse:{q[k][0]}"
     if "ats_id" in q:
         return f"ats:{q['ats_id'][0].lower()}"
+    # ADP Workforce Now serves every tenant from one path, and its jobId carries a "_1"
+    # suffix, so the digits-only rule below misses it and every ADP posting collapses to
+    # "<host>/.../recruitment.html". Measured 4 Oct: two ADP postings from different
+    # companies keyed identically and the second was refused as a duplicate. The tenant
+    # lives in cid (ccId is the same constant everywhere), so key on cid + jobId.
+    if "adp.com" in host and q.get("jobId"):
+        return f"adp:{q.get('cid', [''])[0].lower()}:{q['jobId'][0].lower()}"
     # Same trap as Indeed below, but on company careers sites: the posting id lives in a
     # generic query param (?jobId=, ?gh_src=..., ?requisitionId=) and the path is identical
     # for every opening, so without this every Celonis/Workday-style posting collapses to
@@ -342,7 +349,9 @@ def fix_meta(r: dict) -> dict:
     r["source"] = src
     r["ats"] = ats or ats_from_url(r.get("url", ""))
     r["apply_type"] = norm(r.get("apply_type"))
-    if r.get("url") and not r.get("job_key"):
+    # Keys stored before ADP had its own rule are the shared path, which matches every
+    # other ADP posting; re-key those and leave every other stored key alone.
+    if r.get("url") and (not r.get("job_key") or r["job_key"].startswith("workforcenow.adp.com/")):
         r["job_key"] = job_key(r["url"])
     return {k: (before[k], r.get(k, "")) for k in before if before[k] != r.get(k, "")}
 
