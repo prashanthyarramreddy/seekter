@@ -170,9 +170,45 @@ class NormaliseTests(unittest.TestCase):
         self.assertEqual(sk.fix_meta(dict(r)), {})
 
 
+class ScreeningTests(unittest.TestCase):
+    def test_screen_reports_exclusions_and_literal_location_phrases(self):
+        cfg = dict(blocked_companies=["Flex"], location_flags=["US only", "C++"])
+        keep, drop = sk.title_filters(dict(title_keep="designer", title_drop="interior"))
+        self.assertEqual(sk.screen("Designer", "Flex Ltd", "Remote", cfg, keep, drop), ("skip", "blocked company: Flex"))
+        self.assertEqual(sk.screen("Designer", "WorkFlex", "Remote", cfg, keep, drop), ("consider", ""))
+        self.assertEqual(sk.screen("Interior Designer", "Acme", "", cfg, keep, drop), ("skip", "title_drop: Interior"))
+        self.assertEqual(sk.screen("Engineer", "Acme", "", cfg, keep, drop), ("skip", "title_keep: no match"))
+        self.assertEqual(sk.screen("Designer", "Acme", "Remote, us ONLY", cfg, keep, drop), ("flag", "location: US only"))
+        self.assertEqual(sk.screen("Designer", "Acme", "C++ required", cfg, keep, drop), ("flag", "location: C++"))
+        self.assertEqual(sk.screen("Designer", "Acme", "C required; AUS only", cfg, keep, drop), ("consider", ""))
+
+
+    def test_phrase_lists_ignore_empty_entries_and_accept_none(self):
+        self.assertEqual(sk.blocked_company("Acme", dict(blocked_companies=None)), "")
+        self.assertEqual(sk.location_flag("Remote", dict(location_flags=None)), "")
+        self.assertEqual(sk.location_flag("Remote", dict(location_flags=["", "  "])), "")
+        self.assertEqual(sk.location_flag("US only", dict(location_flags=["  US only  "])), "location: US only")
+        for key in ("blocked_companies", "location_flags"):
+            for value in ("US only", 3, {}, [3]):
+                with self.assertRaisesRegex(SystemExit, key + " must be a list of names/phrases"):
+                    sk._phrase_list({key: value}, key)
+
+
 class TableTests(unittest.TestCase):
     """A skip row is a markdown table cell, so a reason containing a pipe has to
     survive being read and written repeatedly."""
+
+    def test_clean_text_removes_terminal_controls_and_bidi(self):
+        self.assertEqual(sk.clean_text("\x1b[31mRed\x1b[0m"), "Red")
+        self.assertEqual(sk.clean_text("A\x00\x85\u202e\u2066B\t  C\nD"), "A B C D")
+        self.assertEqual(sk.clean_text("  ABC DEF  ", 4), "ABC ")
+        self.assertEqual(sk.clean_text(123), "123")
+        self.assertEqual(sk.clean_text("Product\nDesigner"), "Product Designer")
+        self.assertEqual(sk.clean_text("A\t\n\r\v\f\x85\u2028\u2029B"), "A B")
+
+    def test_markdown_urls_encode_delimiters_only_for_display(self):
+        self.assertEqual(sk._md_url("javascript:alert(1)"), "")
+        self.assertEqual(sk._md_url("https://example.com/a (b)<c>[d]\\|"), "https://example.com/a%20%28b%29%3Cc%3E%5Bd%5D%5C%7C")
 
     def test_escaping_a_cell_is_idempotent(self):
         once = sk._cell("remote | EU only")
@@ -221,6 +257,288 @@ class TrackerTests(unittest.TestCase):
 
     def skips_table(self, month=None):
         return (self.tmp / "applications" / (month or TODAY[:7]) / "skipped.md").read_text()
+
+    def test_add_cleans_role_and_keeps_table_columns_and_no_temp_files(self):
+        path = self.add(company="Acme", role="Designer\x1b[2J](javascript:x) | Remote", status="applied",
+                        url="javascript:x", notes="Line\nTwo\t\x01\u202e", answers="\x1b[31mAnswer\x1b[0m")
+        self.assertNotIn("\x1b", path.read_text())
+        self.assertIn("Line\nTwo\t", path.read_text())
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertNotRegex(index, r"(?<!\\)(?:\\\\)*\]\(javascript:")
+        row = next(x for x in index.splitlines() if "Designer" in x)
+        self.assertEqual(len(sk._split_row(row)), 6)
+        self.assertEqual({p.name for p in path.parent.iterdir()}, {path.name, "README.md"})
+
+    def test_role_backslash_cannot_unescape_link_text(self):
+        self.add(company="Acme", role=r"x\](https://evil)", url="https://example.com/role")
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertIn(r"[x\\\](https://evil)]", index)
+        self.assertNotRegex(index, r"(?<!\\)(?:\\\\)*\]\(https://evil\)")
+
+    def test_posting_url_escaping_keeps_record_identity(self):
+        url = "https://a.example/)[click](javascript:alert(1)"
+        path = self.add(company="Acme", role="Designer", url=url)
+        self.assertIn("url: " + url, path.read_text())
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertNotIn("](javascript:", index)
+        self.assertIn("%29%5Bclick%5D%28javascript:alert%281%29", index)
+        skip_url = url + "/skip"
+        self.add(company="Acme", role="Designer", status="skipped", url=skip_url)
+        self.assertNotIn("](javascript:", self.skips_table())
+        skip_path = self.tmp / "applications" / TODAY[:7] / "skipped.md"
+        record = sk.read_skips(skip_path)[0]
+        self.assertEqual(record["url"], skip_url)
+        self.assertEqual(sk.job_key(record["url"]), sk.job_key(skip_url))
+        encoded_url = "https://a.example/already%29encoded"
+        self.add(company="Other", role="Designer", status="skipped", url=encoded_url)
+        encoded = next(r for r in sk.read_skips(skip_path) if r["company"] == "Other")
+        self.assertEqual(encoded["url"], encoded_url)
+        self.assertEqual(sk.job_key(encoded["url"]), sk.job_key(encoded_url))
+
+    def test_filter_test_date_validation_matches_queue(self):
+        for date in ("../outside", "2026-02-30", "20261012"):
+            rc, out, err = self.run_cli("filter-test", "--date", date, "--titles", "-", "--keep", "designer", stdin="Designer\n")
+            self.assertEqual(rc, 1)
+            self.assertIn("problem: --date must be YYYY-MM-DD", out + err)
+
+    def test_angle_brackets_do_not_make_tracker_autolinks(self):
+        self.add(company="<https://evil>", role="<javascript:alert(1)>", url="https://example.com/autolink")
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertNotIn("<https://evil>", index)
+        self.assertNotIn("<javascript:", index)
+        self.assertIn("&lt;https://evil&gt;", index)
+        self.assertIn("&lt;javascript:alert(1)&gt;", index)
+
+    def test_queue_uses_run_date_for_posted_freshness_and_escapes_location(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer")))
+        date = "2020-01-10"
+        run = self.tmp / "runs" / date
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([
+            dict(company="Age", title="Designer", url="https://example.com/age", age=2)]))
+        (run / "employers.json").write_text(json.dumps([
+            dict(company="Posted", title="Designer", location="<https://evil>", url="https://example.com/posted", posted="2020-01-09")]))
+        rc, out, err = self.run_cli("queue", "--date", date)
+        self.assertEqual(rc, 0, err)
+        text = (run / "queue.md").read_text()
+        rows = [sk._split_row(x) for x in text.splitlines() if x.startswith("| ")][1:]
+        self.assertEqual([r[3] for r in rows], ["Posted", "Age"])
+        self.assertNotIn("<https://evil>", text)
+        self.assertEqual(rows[0][5], "&lt;https://evil&gt;")
+
+    def test_move_refuses_profile_and_symlink_outside_tracker(self):
+        profile = self.tmp / "profile" / "profile.md"
+        profile.parent.mkdir()
+        profile.write_bytes(b"Profile remains intact\n")
+        before = profile.read_bytes()
+        proc = subprocess.run([sys.executable, str(self.tmp / "scripts" / "seekter.py"),
+                               "move", "../profile/profile.md", "applied"], cwd=self.tmp / "scripts",
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refusing:", proc.stderr)
+        self.assertEqual(profile.read_bytes(), before)
+        month = self.tmp / "applications" / TODAY[:7]
+        month.mkdir()
+        link = month / "escape.md"
+        link.symlink_to(profile)
+        rc, _, err = self.run_cli("move", str(link), "applied")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("refusing:", err)
+        self.assertEqual(profile.read_bytes(), before)
+
+    def test_queue_filters_deduplicates_orders_and_leaves_tracker_unchanged(self):
+        self.add(company="Acme", role="Designer", url="https://example.com/tracked")
+        self.add(company="Oldco", role="Designer", url="https://example.com/old", status="closed")
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer", title_drop="interior")))
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([
+            dict(company="Acme", title="Designer", url="https://example.com/tracked", age=0),
+            dict(company="Fresh", title="Designer", url="https://example.com/new", age=1),
+            dict(company="Acme", title="Designer", url="https://example.com/hold", age=0),
+            dict(company="Drop", title="Interior Designer", url="https://example.com/drop", age=0)]))
+        (run / "employers.json").write_text(json.dumps([
+            dict(company="Fresh", title="Designer", url="https://example.com/new"),
+            dict(company="Oldco", title="Designer", url="https://example.com/same", posted=TODAY)]))
+        (run / "hn.json").write_text(json.dumps([
+            dict(header="HNco | Remote", url="https://news.ycombinator.com/item?id=123"),
+            dict(header="Dropco | Interior | Remote", url="https://news.ycombinator.com/item?id=125"),
+            dict(header="Designer", url="https://news.ycombinator.com/item?id=124")]))
+        before = {p: p.read_bytes() for p in (self.tmp / "applications").rglob("*") if p.is_file()}
+        rc, out, err = self.run_cli("queue")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("queue: 5 postings (3 new, 1 same company, 1 on hold), 2 already tracked or duplicate, 0 flagged, 0 blocked company", out)
+        table = [sk._split_row(x) for x in (run / "queue.md").read_text().splitlines() if x.startswith("| ")][1:]
+        self.assertEqual([x[1] for x in table], ["NEW", "NEW", "NEW", "SAMECO", "HOLD"])
+        self.assertEqual([x[3] for x in table[:3]], ["Fresh", "HNco", ""])
+        self.assertEqual(table[1][4], "HNco | Remote")
+        self.assertEqual(before, {p: p.read_bytes() for p in (self.tmp / "applications").rglob("*") if p.is_file()})
+
+    def test_queue_preserves_hand_section_verbatim(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer")))
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text("[]")
+        self.assertEqual(self.run_cli("queue")[0], 0)
+        queue = run / "queue.md"
+        self.assertIn("## Added by hand\n\nLinkedIn, board", queue.read_text())
+        hand = "## Added by hand\r\n\r\n| links | Designer | https://example.com/manual | A | hold reason |\r\n"
+        queue.write_bytes(queue.read_bytes().split(b"## Added by hand")[0] + hand.encode())
+        self.assertEqual(self.run_cli("queue")[0], 0)
+        self.assertTrue(queue.read_bytes().endswith(hand.encode()))
+        self.assertIn("HN rows were title-matched on the whole post", queue.read_text())
+
+    def test_move_preserves_record_permissions(self):
+        path = self.add(company="Acme", role="Designer", url="https://example.com/mode")
+        path.chmod(0o644)
+        rc, _, err = self.run_cli("move", str(path), "interviewing")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+    def test_company_and_posting_cannot_break_index_table(self):
+        self.add(company="[x](https://evil)", role="Designer", url="https://x.example/?a=1|2", location_fit="A|B")
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertNotRegex(index, r"(?<!\\)(?:\\\\)*\]\(https://evil\)")
+        row = next(x for x in index.splitlines() if "Designer" in x)
+        self.assertEqual(len(sk._split_row(row)), 6)
+        self.assertIn("https://x.example/?a=1%7C2", row)
+
+    def test_queue_empty_urls_are_kept_and_filtered_rows_do_not_claim_keys(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer", title_drop="interior")))
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([
+            dict(company="Acme", title="Interior Designer", url="https://example.com/shared"),
+            dict(company="Acme", title="Designer", url=""),
+            dict(company="Other", title="Designer", url="")]))
+        (run / "employers.json").write_text(json.dumps([
+            dict(company="Acme", title="Designer", url="https://example.com/shared")]))
+        rc, out, err = self.run_cli("queue")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("queue: 3 postings (3 new, 0 same company, 0 on hold), 0 already tracked or duplicate, 0 flagged, 0 blocked company", out)
+
+    def test_queue_invalid_sweep_data_reports_problem_without_traceback(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer")))
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        for data in ("not json", "{}", "[1]", "[null]"):
+            (run / "freehire.json").write_text(data)
+            rc, out, err = self.run_cli("queue")
+            self.assertEqual(rc, 1)
+            self.assertIn(f"problem: runs/{TODAY}/freehire.json is not valid", out)
+            self.assertNotIn("Traceback", err)
+            self.assertFalse((run / "queue.md").exists())
+
+    def test_filter_test_file_overrides_stdin_and_no_writes(self):
+        titles = self.tmp / "titles.txt"
+        titles.write_text("Designer\ndesigner\nInterior Designer\nEngineer\n")
+        before = {p: p.read_bytes() for p in self.tmp.rglob("*") if p.is_file()}
+        rc, out, err = self.run_cli("filter-test", "--titles", str(titles), "--keep", "designer", "--drop", "interior")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("WOULD CONSIDER (1)\n  ✓ Designer", out)
+        self.assertIn("WOULD SKIP (2)\n  ✗ Engineer   ← no keep match\n  ✗ Interior Designer   ← Interior", out)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.tmp.rglob("*") if p.is_file()})
+        rc, out, err = self.run_cli("filter-test", "--titles", "-", "--keep", "designer", "--drop", "", stdin="Designer\n")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("WOULD CONSIDER (1)", out)
+        rc, out, err = self.run_cli("filter-test", "--titles", str(titles), "--keep", "[")
+        self.assertEqual(rc, 1)
+        self.assertIn("problem:", out + err)
+
+    def test_filter_test_does_not_migrate_legacy_settings(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        legacy = profile / "search.json"
+        legacy.write_text(json.dumps(dict(title_keep="designer")))
+        before = legacy.read_bytes()
+        rc, out, err = self.run_cli("filter-test", "--titles", "-", stdin="Designer\n")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertFalse((profile / "settings.json").exists())
+
+    def test_filter_test_sweeps_and_title_drops_only(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer", title_drop="interior")))
+        rc, out, _ = self.run_cli("filter-test")
+        self.assertEqual(rc, 1)
+        self.assertIn("problem: no titles to test", out)
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([dict(title="Designer")]))
+        (run / "hn.json").write_text(json.dumps([dict(header="Acme | Designer")]))
+        (run / "hn-dropped.json").write_text(json.dumps([dict(title="HN Interior Designer", reason="title_drop: Interior")]))
+        (run / "employers-dropped.json").write_text(json.dumps([
+            dict(title="Interior Designer", reason="title_drop: Interior"),
+            dict(title="Engineer", reason="title_keep: no match"),
+            dict(title="Sector Designer", reason="sector: adult")]))
+        rc, out, err = self.run_cli("filter-test")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("WOULD CONSIDER (1)", out)
+        self.assertIn("WOULD SKIP (2)", out)
+        self.assertNotIn("Sector Designer", out)
+        self.assertNotIn("Acme | Designer", out)
+        self.assertNotIn("HN Interior Designer", out)
+        self.assertEqual(out.count("(HN posts are matched on the whole post by the sweep, so they are not part of this test)"), 1)
+
+    def test_queue_flags_blocks_escapes_and_preserves_hand_section(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        (profile / "settings.json").write_text(json.dumps(dict(title_keep="designer", blocked_companies=["Blocked"], location_flags=["US only"])))
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([
+            dict(company="Blocked", title="Designer", url="https://example.com/blocked"),
+            dict(company="Flagged", title="Designer", location="US only", url="https://example.com/flagged", age=0),
+            dict(company="[Acme](https://evil)", title="Designer [x](https://evil)", location="[apply here](https://evil)", url="javascript:x", age=9),
+            dict(company="Carried", title="Designer", flag="location: [previous flag](https://evil)", url="https://a.example/)[click](javascript:alert(1)", age=1)]))
+        (run / "queue.md").write_text("old\n## Added by hand\n\nmanual candidate\n")
+        rc, out, err = self.run_cli("queue")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("2 flagged, 1 blocked company", out)
+        text = (run / "queue.md").read_text()
+        self.assertIn("| Location | Flag | Apply URL |", text)
+        self.assertTrue(text.endswith("## Added by hand\n\nmanual candidate\n"))
+        self.assertNotRegex(text, r"(?<!\\)(?:\\\\)*\]\(https://evil\)")
+        rows = [sk._split_row(x) for x in text.splitlines() if x.startswith("| ")][1:]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r[3] for r in rows[1:]], ["Flagged", "Carried"])
+        self.assertEqual(rows[0][-1], "")
+        self.assertEqual(rows[0][5], r"\[apply here\](https://evil)")
+        self.assertEqual(rows[2][6], r"location: \[previous flag\](https://evil)")
+        self.assertNotIn("](javascript:", text)
+        self.assertEqual(rows[2][7], sk._md_url("https://a.example/)[click](javascript:alert(1)"))
+        self.assertTrue(all(len(r) == 8 for r in rows))
+
+    def test_settings_check_rejects_screening_settings(self):
+        profile = self.tmp / "profile"
+        profile.mkdir()
+        for key in ("location_flags", "blocked_companies"):
+            for value in ("US only", [""], [3]):
+                (profile / "settings.json").write_text(json.dumps({key: value}))
+                rc, out, _ = self.run_cli("settings", "--check")
+                self.assertEqual(rc, 1)
+                self.assertIn(f"problem: {key} must be a list of non-empty strings", out)
+
+    def test_skip_non_http_link_is_plain_cleaned_text(self):
+        self.add(company="Acme", role="Designer", status="skipped", url="javascript:x")
+        self.assertIn("| javascript:x |", self.skips_table())
+        self.assertNotIn("<javascript:x>", self.skips_table())
+
+    def test_queue_without_sweep_output(self):
+        rc, out, _ = self.run_cli("queue")
+        self.assertEqual(rc, 1)
+        self.assertIn("problem: no sweep output", out)
 
     # -- dedup ------------------------------------------------------------
 
@@ -651,6 +969,130 @@ class FreehireSweepTests(unittest.TestCase):
         urls = self.log.read_text().splitlines() if self.log.exists() else []
         return p.returncode, p.stderr, urls
 
+    def test_failed_requests_report_incomplete_and_all_fail_exit_three(self):
+        fake = self.tmp / "bin" / "curl"
+        for partial in (False, True):
+            fake.write_text('#!/bin/sh\nfor a in "$@"; do last="$a"; done\n' +
+                            ('case "$last" in *regions=eu*) echo \'{"data": []}\'; exit 0;; esac\n' if partial else '') + 'exit 7\n')
+            self.sweep(dict(regions=["eu", "other"], home_country=""))
+            proc = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py")],
+                                  capture_output=True, text=True, env=self.env)
+            self.assertEqual(proc.returncode, 0 if partial else 3, proc.stderr)
+            self.assertIn(f"problem: {1 if partial else 2} of 2 freehire requests failed", proc.stdout)
+            self.assertEqual(json.loads((self.tmp / "runs" / TODAY / "freehire.json").read_text()), [])
+
+    def test_bad_json_is_a_failed_request(self):
+        (self.tmp / "bin" / "curl").write_text('#!/bin/sh\necho broken-json\n')
+        self.sweep(dict(regions=["eu"], home_country=""))
+        proc = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py")],
+                              capture_output=True, text=True, env=self.env)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("problem: 1 of 1 freehire requests failed", proc.stdout)
+
+    def test_detail_quotes_slug_and_prints_in_order(self):
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([
+            dict(slug="slow/one?x", company="Acme", title="Designer", url="https://example.com/one"),
+            dict(slug="fast", company="Acme", title="Designer", url="https://example.com/two")]))
+        fake = self.tmp / "bin" / "curl"
+        fake.write_text(f'#!{sys.executable}\nimport json, sys, time\nu=sys.argv[-1]\nwith open({str(self.log)!r}, "a") as f: f.write(u+"\\n")\nif "slow" in u: time.sleep(0.15)\nprint(json.dumps(dict(data=dict(description="Remote role"))))\n')
+        proc = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py"), "--detail", "0, 1"],
+                              capture_output=True, text=True, env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(proc.stdout.index("===== 0"), proc.stdout.index("===== 1"))
+        self.assertIn("https://freehire.me/api/v1/jobs/slow%2Fone%3Fx", self.log.read_text())
+
+    def test_parsed_search_error_counts_as_one_failure_per_request(self):
+        fake = self.tmp / "bin" / "curl"
+        for response in ('{"error":"x"}', '{"data":{}}', '[]'):
+            fake.write_text(f"#!/bin/sh\necho '{response}'\n")
+            self.sweep(dict(regions=["eu"], home_country=""))
+            p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py")], capture_output=True, text=True, env=self.env)
+            self.assertEqual(p.returncode, 3, p.stderr)
+            self.assertIn("problem: 1 of 1 freehire requests failed", p.stdout)
+
+    def test_detail_validates_indices_and_missing_output(self):
+        script = self.tmp / "scripts" / "freehire_sweep.py"
+        proc = subprocess.run([sys.executable, str(script), "--detail", "99"], capture_output=True, text=True, env=self.env)
+        self.assertIn("problem: run the sweep first", proc.stderr)
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text('[{"slug": "acme"}]')
+        for index in ("99", "x", "-1", "²"):
+            proc = subprocess.run([sys.executable, str(script), "--detail", index], capture_output=True, text=True, env=self.env)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("problem: no candidate " + index, proc.stderr)
+        self.assertFalse(self.log.exists())
+
+    def configure_screening(self, **extra):
+        cfg = dict(title_keep="designer", title_drop="interior", blocked_companies=["Blocked"],
+                   location_flags=["US only"], languages=["en"], blocked_domains=["adult"],
+                   freehire=dict(queries=["designer"], categories=["design"], regions=["eu"], home_country="", window_days=3))
+        cfg.update(extra)
+        (self.tmp / "profile" / "settings.json").write_text(json.dumps(cfg))
+
+    def fake_jobs(self, rows):
+        board = self.tmp / "jobs.json"
+        board.write_text(json.dumps(dict(data=rows)))
+        (self.tmp / "bin" / "curl").write_text(f'#!/bin/sh\ncat "{board}"\n')
+
+    def test_sweep_records_every_drop_stage_and_keeps_flag(self):
+        self.configure_screening()
+        subprocess.run([sys.executable, str(self.tmp / "scripts" / "seekter.py"), "add", "--company", "Acme", "--role", "Designer", "--url", "https://example.com/tracked"], check=True, capture_output=True)
+        def job(slug, **values):
+            row = dict(slug=slug, title="Designer", company="Acme", location="Remote", url="https://example.com/" + slug, posted_at=TODAY + "T00:00:00Z")
+            row.update(values)
+            return row
+        self.fake_jobs([job("closed", closed_at=TODAY), job("sector", enrichment=dict(domains=["adult"])),
+                        job("language", enrichment=dict(posting_language="zz")), job("drop", title="Interior Designer"),
+                        job("keep", title="Engineer"), job("company", company="Blocked Ltd"),
+                        job("stale", posted_at="2000-01-01T00:00:00Z"), job("tracked"),
+                        job("flag", countries=["US only"]), job("consider", title="Designer\x1b[2J")])
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py")], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        run = self.tmp / "runs" / TODAY
+        rows = json.loads((run / "freehire.json").read_text())
+        self.assertEqual([r["slug"] for r in rows], ["flag", "consider"])
+        self.assertEqual(rows[0]["flag"], "location: US only")
+        dropped = json.loads((run / "freehire-dropped.json").read_text())
+        reasons = {r["url"].rsplit("/", 1)[-1]: r["reason"] for r in dropped}
+        self.assertEqual(len(reasons), 8)
+        self.assertEqual(reasons["drop"], "title_drop: Interior")
+        self.assertEqual(reasons["keep"], "title_keep: no match")
+        self.assertEqual(reasons["company"], "blocked company: Blocked")
+        for stage in ("closed", "sector", "language", "stale", "tracked"):
+            self.assertTrue(reasons[stage].startswith(stage))
+        self.assertIn(f"dropped postings and their reasons: runs/{TODAY}/freehire-dropped.json", p.stdout)
+        self.assertIn('"company": 1', p.stdout)
+
+    def test_freehire_validates_phrase_settings_before_network(self):
+        self.configure_screening(location_flags="US only")
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py")], capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("problem: profile/settings.json location_flags must be a list of names/phrases", p.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_sample_needs_no_title_keep_and_keeps_excluded_titles(self):
+        self.configure_screening(title_keep="")
+        self.fake_jobs([dict(slug="1", title="Designer"), dict(slug="2", title="designer"),
+                        dict(slug="3", title="Interior Designer"), dict(slug="4", title="Closed", closed_at=TODAY)])
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py"), "--sample"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.tmp / "runs" / TODAY / "sample-titles.txt").read_text().splitlines(), ["Designer", "Interior Designer"])
+        self.assertIn("2 real titles →", p.stdout)
+
+    def test_detail_reports_the_failed_entry(self):
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([dict(slug=slug, company="Acme", title="Designer", url="https://example.com/" + slug) for slug in ("fail", "ok")]))
+        (self.tmp / "bin" / "curl").write_text('#!/bin/sh\nfor a in "$@"; do last="$a"; done\ncase "$last" in */fail) exit 7;; esac\necho \'{"data": {"description": "Remote role"}}\'\n')
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py"), "--detail", "all"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.count("(fetch failed)"), 1)
+        self.assertIn("problem: 1 of 2 detail requests failed; those entries show no eligibility lines", p.stdout)
+        self.assertIn("  - Remote role", p.stdout)
+
     def test_a_home_country_without_regions_sweeps_by_country_only(self):
         # PR #39: freehire's own region for Turkey returns 0, so a home-country-only
         # candidate sets regions to [] and must still get the countries pass.
@@ -708,6 +1150,100 @@ class EmployerSweepTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(self.tmp / "scripts" / "employer_sweep.py")],
                               capture_output=True, text=True, env=self.env)
 
+    def test_hn_keeps_body_matches_and_drops_header_only_exclusions(self):
+        # HN headers often name the company and location before any role appears.
+        body = " details" * 30 + " hiring a Designer"
+        responses = self.tmp / "hn-responses.json"
+        responses.write_text(json.dumps({
+            "search": dict(hits=[dict(title="Ask HN: Who is hiring?", objectID="100")]),
+            "thread": dict(children=[
+                dict(id=101, text="Acme | Remote" + body),
+                dict(id=102, text="Acme | Interior | Remote" + body),
+                dict(id=103, text="Acme | Interior Designer | Remote"),
+                dict(id=104, text="Acme | Remote | Engineer")])}))
+        fake = self.tmp / "bin" / "curl"
+        fake.write_text(f'#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\nd=json.loads(Path({str(responses)!r}).read_text())\nprint(json.dumps(d["search" if "search_by_date" in sys.argv[-1] else "thread"]))\n')
+        (self.tmp / "profile" / "settings.json").write_text(json.dumps(dict(title_keep="designer", title_drop="interior")))
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "employer_sweep.py"), "--hn"],
+                           capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads((self.tmp / "runs" / TODAY / "hn.json").read_text())
+        self.assertEqual([row["id"] for row in rows], [101, 103])
+        self.assertNotIn("Designer", rows[0]["header"])
+
+    def test_sweep_rejects_string_phrase_settings(self):
+        log = self.tmp / "early-validation.log"
+        (self.tmp / "bin" / "curl").write_text(f'#!/bin/sh\necho called >> "{log}"\necho "{{}}"\n')
+        for key in ("blocked_companies", "location_flags"):
+            (self.tmp / "profile" / "settings.json").write_text(json.dumps(dict(title_keep="designer", employers=[dict(name="Acme", ats="greenhouse", slug="acme")], **{key: "US only"})))
+            for args in ([], ["--hn"]):
+                p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "employer_sweep.py"), *args], capture_output=True, text=True, env=self.env)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn(f"problem: profile/settings.json {key} must be a list of names/phrases", p.stderr)
+                self.assertFalse(log.exists())
+
+    def test_employers_screen_companies_and_flag_locations(self):
+        (self.tmp / "profile" / "settings.json").write_text(json.dumps(dict(title_keep="designer", title_drop="interior", blocked_companies=["Blocked"], location_flags=["Europe"], employers=[dict(name=name, ats="greenhouse", slug="acme") for name in ("Blocked", "Acme")])))
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "employer_sweep.py")], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        run = self.tmp / "runs" / TODAY
+        rows = json.loads((run / "employers.json").read_text())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["flag"], "location: Europe")
+        dropped = json.loads((run / "employers-dropped.json").read_text())
+        self.assertEqual(sum(r["reason"] == "blocked company: Blocked" for r in dropped), 4)
+        self.assertIn("title_drop: Interior", [r["reason"] for r in dropped])
+        self.assertIn("title_keep: no match", [r["reason"] for r in dropped])
+
+    def test_hn_screening_keeps_body_rule_and_logs_drops(self):
+        responses = self.tmp / "screened-hn.json"
+        responses.write_text(json.dumps({
+            "search": dict(hits=[dict(title="Ask HN: Who is hiring?", objectID="100")]),
+            "thread": dict(children=[
+                dict(id=101, text="Blocked | Designer | Remote"),
+                dict(id=102, text="Acme | US only" + " details" * 30 + " Designer"),
+                dict(id=103, text="Acme | Interior | Remote" + " details" * 30 + " Designer"),
+                dict(id=104, text="Acme | Engineer"),
+                dict(id=105, text="Blocked Designer")])}))
+        (self.tmp / "bin" / "curl").write_text(f'#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\nd=json.loads(Path({str(responses)!r}).read_text())\nprint(json.dumps(d["search" if "search_by_date" in sys.argv[-1] else "thread"]))\n')
+        (self.tmp / "profile" / "settings.json").write_text(json.dumps(dict(title_keep="designer", title_drop="interior", blocked_companies=["Blocked"], location_flags=["US only"])))
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "employer_sweep.py"), "--hn"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        run = self.tmp / "runs" / TODAY
+        rows = json.loads((run / "hn.json").read_text())
+        self.assertEqual([r["id"] for r in rows], [102, 105])
+        self.assertEqual(rows[0]["flag"], "location: US only")
+        drops = json.loads((run / "hn-dropped.json").read_text())
+        self.assertEqual([r["reason"] for r in drops], ["blocked company: Blocked", "title_drop: Interior", "title_keep: no match"])
+
+    def test_new_boards_dates_and_invalid_slug(self):
+        boards = self.tmp / "boards.json"
+        boards.write_text(json.dumps({
+            "smartrecruiters": {"content": [dict(id="123", name="Designer", location=dict(city="City", country="Country", remote=True), releasedDate=TODAY + "T00:00:00Z"), dict(id="456", name="Interior Designer")]},
+            "recruitee": {"offers": [dict(title="Designer", location="City", remote=True, careers_url="https://acme.recruitee.com/o/designer", published_at=TODAY)]},
+            "greenhouse": {"jobs": [dict(id=1, title="Designer", updated_at=TODAY + "T12:00:00Z")]}}))
+        log = self.tmp / "requests.jsonl"
+        fake = self.tmp / "bin" / "curl"
+        fake.write_text(f'#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\nu=sys.argv[-1]\nwith open({str(log)!r}, "a") as f: f.write(u+"\\n")\nd=json.loads(Path({str(boards)!r}).read_text())\nprint(json.dumps(d["smartrecruiters" if "smartrecruiters" in u else "recruitee" if "recruitee" in u else "greenhouse"]))\n')
+        p = self.sweep([dict(name="Acme", ats=ats, slug="acme") for ats in ("smartrecruiters", "recruitee", "greenhouse")] + [dict(name="Bad", ats="greenhouse", slug="../x")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('problem: Bad: slug "../x" has characters a board id never has', p.stdout)
+        requests = log.read_text().splitlines()
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all("../x" not in x for x in requests))
+        rows = json.loads((self.tmp / "runs" / TODAY / "employers.json").read_text())
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["url"], "https://jobs.smartrecruiters.com/acme/123")
+        self.assertEqual(rows[0]["location"], "City Country remote")
+        self.assertEqual(rows[1]["url"], "https://acme.recruitee.com/o/designer")
+        self.assertTrue(all(row["posted"] == TODAY for row in rows))
+
+    def test_invalid_title_regex_exits_before_request(self):
+        (self.tmp / "profile" / "settings.json").write_text(json.dumps(dict(title_keep="[", employers=[dict(name="Acme", ats="greenhouse", slug="acme")])))
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "employer_sweep.py")], capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not a valid regex", p.stderr)
+
     def test_titles_are_filtered_and_tracked_postings_dropped(self):
         subprocess.run([sys.executable, str(self.tmp / "scripts" / "seekter.py"), "add", "--company", "Acme",
                         "--role", "Product Designer, Growth", "--status", "applied",
@@ -726,6 +1262,18 @@ class EmployerSweepTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("problem: Nobody: no board at ashby:nobody", p.stdout)
         self.assertIn("problem: Odd: no board at taleo:odd", p.stdout)
+
+    def test_missing_and_empty_slugs_are_reported_without_requests(self):
+        fake = self.tmp / "bin" / "curl"
+        log = self.tmp / "slug-requests.log"
+        fake.write_text(f'#!/bin/sh\necho called >> "{log}"\necho "{{}}"\n')
+        p = self.sweep([dict(name="Acme", ats="greenhouse"),
+                        dict(name="Other", ats="greenhouse", slug="")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("problem: Acme: no slug", p.stdout)
+        self.assertIn("problem: Other: no slug", p.stdout)
+        self.assertNotIn("has characters", p.stdout)
+        self.assertFalse(log.exists())
 
     def test_an_empty_watchlist_stops_the_sweep(self):
         p = self.sweep([])

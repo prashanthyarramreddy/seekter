@@ -10,6 +10,10 @@
     "gambling",
     "adult"
   ],
+  "_blocked_companies": "Companies the candidate never wants to apply to. Names match whole words, not substrings, using the same rule as the same-company check.",
+  "blocked_companies": [],
+  "_location_flags": "Plain phrases that may rule the candidate out given their country and authorization. Flags demote and mark postings; they never delete them. Labels can be wrong, so a flagged posting is still opened, last in its tier.",
+  "location_flags": [],
   "title_keep": "",
   "title_drop": "junior|intern|graduate|werkstudent|praktik|apprentice|head of|director|vp of|chief",
   "freehire": {
@@ -51,7 +55,7 @@
       }
     ]
   },
-  "_employers": "Companies to watch directly: Seekter reads their public job board API every run, so a posting is seen before any aggregator copies it. One row per company: name, ats (greenhouse, ashby, lever or workable) and slug, the board's own id (job-boards.greenhouse.io/<slug>, jobs.ashbyhq.com/<slug>, jobs.lever.co/<slug>, apply.workable.com/<slug>). Pick employers that hire remotely where the candidate lives or sponsor where they would move. Run `python3 scripts/employer_sweep.py`; a wrong slug is reported, not guessed. See reference/sources/direct-employer.md.",
+  "_employers": "Companies to watch directly: Seekter reads their public job board API every run, so a posting is seen before any aggregator copies it. One row per company: name, ats (greenhouse, ashby, lever, workable, smartrecruiters or recruitee) and slug, the board's own id (job-boards.greenhouse.io/<slug>, jobs.ashbyhq.com/<slug>, jobs.lever.co/<slug>, apply.workable.com/<slug>, jobs.smartrecruiters.com/<slug>, <slug>.recruitee.com). Pick employers that hire remotely where the candidate lives or sponsor where they would move. Run `python3 scripts/employer_sweep.py`; a wrong slug is reported, not guessed. See reference/sources/direct-employer.md.",
   "employers": [],
   "_boards": "Job boards for this candidate's field, with how often they are worth a visit. reference/sources/_core.md rates the general ones and reference/sources/ has one file per measured board; niche boards are per-discipline, so ask the candidate which they already read.",
   "boards": [

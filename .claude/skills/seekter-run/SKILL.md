@@ -40,7 +40,7 @@ Then:
 | # | Step | Method in `reference/sources/` |
 |---|---|---|
 | 0 | **Your links**: pasted in chat or in `profile/links.txt` | `your-links.md` |
-| 1 | **API sweeps**: freehire (+ Jobicy), the employer watchlist, and the monthly HN "Who is hiring?" thread | `python3 scripts/freehire_sweep.py`, then `--detail <n>` per candidate (`freehire.md`); `python3 scripts/employer_sweep.py` when `employers` has rows, and `--hn` (`direct-employer.md`, `hacker-news.md`) |
+| 1 | **API sweeps**: freehire (+ Jobicy), the employer watchlist, and the monthly HN "Who is hiring?" thread | `python3 scripts/freehire_sweep.py`, then `--detail <n>` per candidate (`freehire.md`); `python3 scripts/employer_sweep.py` when `employers` has rows, and `--hn` (`direct-employer.md`, `hacker-news.md`); after the sweeps, run `python3 scripts/seekter.py queue` to build `runs/<date>/queue.md`, then add LinkedIn/board/link candidates by hand |
 | 2 | **LinkedIn**: alert emails always; in `read` mode also the notification feed and the `linkedin.searches` rows, within `read_limits` | `linkedin.md` (emails via `inbox.md`) |
 | 3 | **Other boards** at the cadence in the profile | One file per board in `reference/sources/` |
 
@@ -52,6 +52,8 @@ Rules:
 - **A skipped source step is a failed run, not a short one.** If room is running out, cut the number of applications, never the number of sources.
 
 ## 2. Filter every candidate (in this order)
+
+Flagged postings (`flag: location: …`) are opened like any other, last within their tier. The flag is a hint; the posting's own location line binds.
 
 1. **Dedup by Job URL / job ID**, right before opening each form, not only at run start. Same company + different role is fine; same URL = stop. Repeat for every source added mid-run. `scripts/seekter.py check` is the truth.
    - **Run `check` on the apply URL, not only on the source's own job id.** A record is keyed on whichever URL it was first applied through, so a job found on LinkedIn today may be stored under its Ashby/Lever UUID from a board three weeks ago. A bulk grep of source ids will not find it. Measured 23 Sept: a Design System Designer was applied to twice in September and already rejected, and was submitted a **third** time because the sweep deduped 88 LinkedIn ids and the record was keyed `uuid:…`. The check is one command and it runs **after** you resolve the apply URL and **before** you type anything: `python3 scripts/seekter.py check "<apply url>" --company "<name>"`.
@@ -178,12 +180,13 @@ Use the profile's **voice** section and **fact bank**. Engine rules that always 
    ```
    `--url` is always filled; it is what dedup keys on. `--answers` keeps the "no sentence twice" rule checkable: grep `applications/*/` before writing a new answer. Needs-you items are `--status pending` with the exact action in `--notes`. `add` and `move` regenerate `applications/README.md` themselves; pass `--no-index` in a bulk loop and run `index` once at the end.
 2. **Profile/reference upkeep:** new ATS trap → that vendor's file in `reference/ats/` (a vendor with no file gets one, plus a row in `_core.md`'s table); a form rule that holds across vendors → `reference/ats/_core.md`; new source behaviour → that source's file in `reference/sources/` (a source with no file gets one, plus a row in `_core.md`'s table); a lesson that is not about one source's own mechanics → `reference/sources/_core.md`; new rule, blacklist entry, standard answer or fact → `profile/profile.md`. Edit in place; replace outdated text instead of appending history.
-3. **Write the unworked candidates to `runs/<YYYY-MM-DD>/queue-A.md`** before the report, with one row per posting: source id, role, and the **resolved apply URL**. §1 promises that "the queue survives into the next run", and it does not survive on its own: the harvest lives in a browser tab and in the transcript, and both are gone by the next session. A run that sweeps 250 postings and applies to 8 has found 240 things that cost calls to find and nothing to write down.
+3. **The Step 1 `queue` run already wrote the API candidates.** Add the unworked LinkedIn/board/link candidates under `## Added by hand` in `runs/<date>/queue.md` before the report, one row per posting with source id, role, the **resolved apply URL**, the bucket letter as a hint and, for held postings, the hold reason. §1 promises that "the queue survives into the next run", and it does not survive on its own: the harvest lives in a browser tab and in the transcript, and both are gone by the next session. A run that sweeps 250 postings and applies to 8 has found 240 things that cost calls to find and nothing to write down.
    - Record the bucket letter as a **hint, not a verdict**, and say so in the file. The A/B/C split is assigned by regex over the description and matches words like "contractor" and "EMEA" wherever they appear, so a European hybrid office role scores A routinely. The next run opens each one anyway; the letter only decides the order.
    - A posting held rather than skipped goes in this file with its reason, not in `skipped.md`. `skipped.md` means decided against; the queue means not yet reached.
 
 4. **Report** to the user, short, and save the same text as `runs/<YYYY-MM-DD>.md` (append `-2`, `-3` for extra runs that day):
    - The source table, with the LinkedIn mode and, in `read` mode, the searches and detail requests used against their limits. A stop signal goes at the very top.
+   - One line per source with the dropped count and its `runs/<date>/*-dropped.json` path. Skim titles dropped by `title_keep`/`title_drop` for false negatives; if one is found, fix the filter and re-check with `python3 scripts/seekter.py filter-test`.
    - **Applied (n):** role · company · why it fits (one line each). Flag low-odds submissions and same-company second roles.
    - **Needs you (n):** one line each with a direct link and the exact action (CAPTCHA, account, anecdote, T&C, email verification, sector decision).
    - **On LinkedIn, yours to send (n):** Easy Apply postings and alert-mail postings whose employer board could not be found, one line each with the LinkedIn URL and the CV to pick.

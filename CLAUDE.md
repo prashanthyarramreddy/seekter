@@ -10,7 +10,7 @@ Seekter is a job-search agent that runs inside Claude Code: it searches job sour
 | `reference/sources/` | One file per job source: `_core.md` (always read) plus `your-links.md`, `freehire.md`, `linkedin.md` (alert emails; read-only mode with limits), one per board, `inbox.md` | tracked |
 | `reference/ats/` | One file per application form system: `_core.md` (universal rules, the identify table, the hand-off list) plus `greenhouse.md`, `ashby.md`, `workday.md`, `lever.md`… | tracked |
 | `templates/` | Profile and search-config templates that `/seekter-init` fills | tracked |
-| `scripts/seekter.py` | Tracker CLI: check, check-many, add, move, list, index, stats | tracked |
+| `scripts/seekter.py` | Tracker CLI: check, check-many, filter-test, queue, add, move, list, index, stats | tracked |
 | `scripts/freehire_sweep.py` | Step 1 API sweep with the profile's queries | tracked |
 | `scripts/employer_sweep.py` | Step 1 API sweep of the employer watchlist (`employers` in settings) and, with `--hn`, the monthly HN "Who is hiring?" thread | tracked |
 | `scripts/import_csv.py` | One-off import of an existing tracker (Notion/Sheets CSV) | tracked |

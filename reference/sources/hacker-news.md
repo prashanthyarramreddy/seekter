@@ -1,5 +1,7 @@
 # Hacker News "Who is hiring?"
 
+
+Blocked companies are excluded, location-flagged rows carry `flag` and are demoted rather than deleted, and dropped postings with their reasons are recorded in `runs/<date>/hn-dropped.json`.
 `python3 scripts/employer_sweep.py --hn`
 
 On the first weekday of every month the `whoishiring` account opens an "Ask HN: Who is hiring?" thread, and companies post one top-level comment each. The posts come from the people doing the hiring, often founders, and many link straight to the role or to an email address. It is read through the public Algolia API, one search and one item fetch, with no login:

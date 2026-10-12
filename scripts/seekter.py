@@ -10,14 +10,16 @@ applications/README.md and applications/<YYYY-MM>/README.md are generated views.
   python3 scripts/seekter.py add --company X --role Y --status applied --url U [...]
   python3 scripts/seekter.py move <file|url> <status> [--note TEXT]
   python3 scripts/seekter.py list [--status S] [--since YYYY-MM-DD]
+  python3 scripts/seekter.py filter-test [--titles FILE] [--date YYYY-MM-DD] [--keep REGEX] [--drop REGEX]
+  python3 scripts/seekter.py queue [--date YYYY-MM-DD]
   python3 scripts/seekter.py index
   python3 scripts/seekter.py normalize [--dry-run]
   python3 scripts/seekter.py stats [--since YYYY-MM-DD]
   python3 scripts/seekter.py migrate [--keep-old]         (v1 status folders -> month folders)
 """
-import argparse, datetime as dt, json, os, re, shutil, sys, unicodedata
+import argparse, datetime as dt, json, os, re, shutil, sys, tempfile, unicodedata
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 ROOT = Path(__file__).resolve().parent.parent
 APPS = ROOT / "applications"
@@ -27,6 +29,89 @@ FIELDS = ["company", "role", "status", "url", "source", "ats", "apply_type", "lo
 TODAY = dt.date.today().isoformat()
 
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def _clean_chars(s, body=False):
+    s = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(s))
+    return "".join(c for c in s if (body and c in "\n\t") or
+                   not (ord(c) < 32 or 127 <= ord(c) <= 159 or
+                        0x202a <= ord(c) <= 0x202e or 0x2066 <= ord(c) <= 0x2069))
+
+
+def clean_text(s, n=None):
+    s = re.sub(r"[\t\n\r\v\f\x85\u2028\u2029]", " ", str(s))
+    return re.sub(r"\s+", " ", _clean_chars(s)).strip()[:n]
+
+
+def title_filters(cfg):
+    if not cfg.get("title_keep"):
+        sys.exit("No title_keep in profile/settings.json yet. Run /seekter-init, or fill it in by hand.")
+    try:
+        return re.compile(cfg["title_keep"], re.I), re.compile(cfg.get("title_drop") or r"(?!)", re.I)
+    except re.error as e:
+        sys.exit(f"problem: profile/settings.json title_keep/title_drop is not a valid regex: {e}")
+
+
+def title_ok(title, keep, drop):
+    return bool(keep.search(title) and not drop.search(title))
+
+
+def _phrase_list(cfg, key):
+    value = cfg.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(x, str) for x in value):
+        sys.exit(f"problem: profile/settings.json {key} must be a list of names/phrases")
+    return [x.strip() for x in value if x.strip()]
+
+
+def blocked_company(company, cfg):
+    return next((entry for entry in _phrase_list(cfg, "blocked_companies") if same_company(entry, company)), "")
+
+
+def location_flag(location, cfg):
+    return next(("location: " + phrase for phrase in _phrase_list(cfg, "location_flags")
+                 if re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", location, re.I)), "")
+
+
+def screen(title, company, location, cfg, keep, drop):
+    entry = blocked_company(company, cfg)
+    if entry:
+        return "skip", "blocked company: " + entry
+    match = drop.search(title)
+    if match:
+        return "skip", "title_drop: " + match.group(0)
+    if not keep.search(title):
+        return "skip", "title_keep: no match"
+    flag = location_flag(location, cfg)
+    return ("flag", flag) if flag else ("consider", "")
+
+
+def dropped_row(title, company, location, url, reason):
+    return {k: clean_text(v or "") for k, v in zip(
+        ("title", "company", "location", "url", "reason"), (title, company, location, url, reason))}
+
+
+def _atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except FileNotFoundError:
+        mask = os.umask(0)
+        os.umask(mask)
+        mode = 0o666 & ~mask
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, dir=path.parent, encoding="utf-8") as f:
+            name = f.name
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
 
 
 # ---------- job identity ----------
@@ -191,7 +276,7 @@ def write(path: Path, meta: dict, body: str) -> None:
             lines.append(f"{k}: {str(v).replace(chr(10), ' ')}")
     lines.append("---")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n\n" + body.rstrip() + "\n", encoding="utf-8")
+    _atomic_write(path, "\n".join(lines) + "\n\n" + body.rstrip() + "\n")
 
 
 def _cell(v: str) -> str:
@@ -199,6 +284,17 @@ def _cell(v: str) -> str:
     otherwise a value round-tripping through the table grows a backslash each pass."""
     s = re.sub(r"\s+", " ", str(v or "")).strip()
     return s.replace("\\|", "|").replace("|", "\\|")
+
+
+def _md_text(s):
+    text = re.sub(r"\\(?!\|)", lambda m: "\\\\", _cell(s))
+    return text.replace("[", r"\[").replace("]", r"\]").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _md_url(url):
+    if not url.startswith(("http://", "https://")):
+        return ""
+    return quote(url, safe=":/?#@!$&'*+,;=%-._~")
 
 
 def _split_row(line: str):
@@ -218,6 +314,14 @@ def read_skips(path: Path):
             continue
         d = dict(zip(SKIP_COLS, cells))
         url = d["Link"].strip("<>")
+        # Decode only when display escaping changed the stored identity; an already
+        # percent-encoded posting URL must keep the key it originally had.
+        decoded = unquote(url)
+        key = d["Key"].replace("&#91;", "[").replace("&#93;", "]")
+        if d["Key"] not in (job_key(url), job_key(decoded)) and key in (job_key(url), job_key(decoded)):
+            d["Key"] = key
+        if d["Key"] and job_key(url) != d["Key"] and job_key(decoded) == d["Key"]:
+            url = decoded
         # `ats` has no column of its own: it is a pure function of the URL, so it is
         # derived on read. Without it every row would look unnormalised on every pass.
         out.append(dict(updated=d["Date"], company=d["Company"], role=d["Role"], notes=d["Reason"],
@@ -233,12 +337,14 @@ def write_skips(path: Path, recs) -> None:
              "dedup reads the Key column, so a posting here is never evaluated twice.", "",
              "| " + " | ".join(SKIP_COLS) + " |", "|" + "---|" * len(SKIP_COLS)]
     for r in recs:
-        link = f"<{r['url']}>" if r.get("url") else ""
+        url = clean_text(r.get("url") or "")
+        encoded = _md_url(url)
+        link = f"<{encoded}>" if encoded else url
         lines.append("| " + " | ".join(_cell(x) for x in (
             r.get("updated", ""), r.get("company", ""), r.get("role", ""), r.get("notes", ""),
-            r.get("source", ""), link, r.get("job_key", ""))) + " |")
+            r.get("source", ""), link, r.get("job_key", "").replace("[", "&#91;").replace("]", "&#93;"))) + " |")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write(path, "\n".join(lines) + "\n")
 
 
 def all_apps():
@@ -258,12 +364,17 @@ def label(r) -> str:
 def find(target: str):
     p = Path(target).expanduser()
     if not p.is_absolute():
-        p = (Path.cwd() / p) if (Path.cwd() / p).is_file() else (ROOT / p)
-    if p.is_file() and p.name != "skipped.md":
-        return read(p.resolve())
+        p = (Path.cwd() / p) if (Path.cwd() / p).exists() else (ROOT / p)
+    if p.exists():
+        resolved = p.resolve()
+        if not (resolved.is_file() and resolved.suffix == ".md" and
+                resolved.name not in ("README.md", "skipped.md") and
+                MONTH_RE.fullmatch(resolved.parent.name) and resolved.parent.parent == APPS.resolve()):
+            sys.exit(f"refusing: {target} is not a tracker record under applications/")
+        return read(resolved)
     key = job_key(target)
     for a in all_apps():
-        if a.get("job_key") == key or job_key(a.get("url", "")) == key:
+        if (a.get("job_key") or job_key(a.get("url", ""))) == key:
             return a
     return None
 
@@ -434,24 +545,27 @@ def _defaults() -> dict:
         return {}
 
 
-def settings(create: bool = False) -> dict:
+def settings(create: bool = False, read_only: bool = False) -> dict:
     """The user's settings over the template's defaults.
 
     With create=True a missing profile/settings.json is copied from the template, which is
     what /seekter-run does at start so the user has a file to edit."""
-    if not SETTINGS.exists() and LEGACY_SETTINGS.exists():
+    source = SETTINGS
+    if read_only and not SETTINGS.exists() and LEGACY_SETTINGS.exists():
+        source = LEGACY_SETTINGS
+    elif not SETTINGS.exists() and LEGACY_SETTINGS.exists():
         LEGACY_SETTINGS.rename(SETTINGS)
         print("moved profile/search.json to profile/settings.json (values unchanged)", file=sys.stderr)
     elif SETTINGS.exists() and LEGACY_SETTINGS.exists():
         print("warning: both profile/settings.json and profile/search.json exist; only settings.json is read."
               " Move any value you still need from search.json, then delete it.", file=sys.stderr)
-    if not SETTINGS.exists():
-        if create and SETTINGS_TEMPLATE.exists():
+    if not source.exists():
+        if create and not read_only and SETTINGS_TEMPLATE.exists():
             SETTINGS.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(SETTINGS_TEMPLATE, SETTINGS)
             print("created profile/settings.json from the template; every value is a default", file=sys.stderr)
         return _defaults()
-    mine = json.loads(SETTINGS.read_text(encoding="utf-8"))
+    mine = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(mine, dict):
         raise ValueError("the top level must be an object { ... }")
     for k in ("linkedin", "freehire"):
@@ -477,7 +591,11 @@ def same_company(query: str, company: str) -> bool:
     held under the 30-day rule for companies they had never applied to. A held
     posting is skipped, so a false match costs an application, not a line of output.
     """
-    q, c = slug(query, 80), slug(company, 80)
+    return _same_company_slug(query, slug(company, 80))
+
+
+def _same_company_slug(query, c):
+    q = slug(query, 80)
     if not (query or "").strip() or q == "x":
         return False
     return q == c or re.search(rf"(?:^|-){re.escape(q)}(?:-|$)", c) is not None
@@ -526,6 +644,7 @@ def cmd_check_many(a):
     apps = list(all_apps())
     keys = {r.get("job_key") or job_key(r.get("url", "")): r for r in apps}
     days = same_company_days()
+    companies = [(r, slug(r.get("company", ""), 80)) for r in apps]
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -536,12 +655,169 @@ def cmd_check_many(a):
         if r:
             print(f"DUP    {line} -> {r.get('status')} {label(r)}")
             continue
-        same = [x for x in apps if co and same_company(co, x.get("company", ""))]
+        same = [r for r, c in companies if co and _same_company_slug(co, c)]
         tag = "HOLD   " if holding(same, days) else "SAMECO " if same else "NEW    "
         print(tag + line + (f" -> {len(same)} earlier: " + ", ".join(f"{x.get('status')}:{x.get('role')}" for x in same[:3]) if same else ""))
 
 
+def _run_date(value):
+    date = value or TODAY
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            raise ValueError("invalid date")
+        dt.date.fromisoformat(date)
+    except ValueError:
+        sys.exit("problem: --date must be YYYY-MM-DD")
+    return date
+
+
+def cmd_filter_test(a):
+    date = _run_date(a.date)
+    titles = []
+    try:
+        if a.titles:
+            titles = sys.stdin.read().splitlines() if a.titles == "-" else Path(a.titles).read_text(encoding="utf-8").splitlines()
+        else:
+            directory = ROOT / "runs" / date
+            if (directory / "hn.json").exists():
+                print("(HN posts are matched on the whole post by the sweep, so they are not part of this test)")
+            for name in ("freehire", "employers"):
+                for suffix in (".json", "-dropped.json"):
+                    path = directory / (name + suffix)
+                    if path.exists():
+                        for row in json.loads(path.read_text(encoding="utf-8")):
+                            if suffix == "-dropped.json" and not row.get("reason", "").startswith("title_"):
+                                continue
+                            titles.append(row.get("header", row.get("title", "")))
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        sys.exit(f"problem: could not read titles: {clean_text(e)}")
+    unique = {}
+    for title in titles:
+        title = clean_text(title or "")
+        if title:
+            unique.setdefault(title.casefold(), title)
+    if not unique:
+        print("problem: no titles to test (run a sweep, or freehire_sweep.py --sample)")
+        sys.exit(1)
+    try:
+        cfg = settings(read_only=True)
+        if a.keep is not None:
+            cfg["title_keep"] = a.keep
+        if a.drop is not None:
+            cfg["title_drop"] = a.drop
+        keep, drop = title_filters(cfg)
+    except ValueError as e:
+        sys.exit(f"problem: profile/settings.json is not valid: {e}")
+    except SystemExit as e:
+        print(str(e))
+        sys.exit(1)
+    considered, skipped = [], []
+    for title in sorted(unique.values(), key=str.casefold):
+        match = drop.search(title)
+        if match or not keep.search(title):
+            skipped.append((title, match.group(0) if match else "no keep match"))
+        else:
+            considered.append(title)
+    print(f"WOULD CONSIDER ({len(considered)})")
+    for title in considered:
+        print(f"  ✓ {title}")
+    print(f"WOULD SKIP ({len(skipped)})")
+    for title, reason in skipped:
+        print(f"  ✗ {title}   ← {reason}")
+
+
+def cmd_queue(a):
+    date = _run_date(a.date)
+    outdir = ROOT / "runs" / date
+    sources = [("freehire", "freehire.json"), ("employer", "employers.json"), ("hn", "hn.json")]
+    if not any((outdir / name).exists() for _, name in sources):
+        print(f"problem: no sweep output in runs/{date}/ (run the sweeps first)")
+        sys.exit(1)
+    try:
+        cfg = settings()
+        keep, drop = title_filters(cfg)
+    except ValueError as e:
+        sys.exit(f"problem: profile/settings.json is not valid: {e}")
+    apps = list(all_apps())
+    seen = {r.get("job_key") or job_key(r.get("url", "")) for r in apps}
+    companies = [(r, slug(r.get("company", ""), 80)) for r in apps]
+    days = same_company_days()
+    out, dropped, blocked = [], 0, 0
+    for source, name in sources:
+        path = outdir / name
+        if not path.exists():
+            continue
+        try:
+            sweep_rows = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError):
+            print(f"problem: runs/{date}/{name} is not valid JSON")
+            sys.exit(1)
+        if not isinstance(sweep_rows, list) or any(not isinstance(row, dict) for row in sweep_rows):
+            print(f"problem: runs/{date}/{name} is not valid sweep output (expected a list of objects)")
+            sys.exit(1)
+        for row in sweep_rows:
+            title = clean_text(row.get("header" if source == "hn" else "title") or "")
+            company = clean_text(row.get("company") or "") if source != "hn" else (title.split("|", 1)[0].strip() if "|" in title else "")
+            url = clean_text(row.get("url") or "")
+            key = job_key(url)
+            if blocked_company(company, cfg):
+                blocked += 1
+                continue
+            location = clean_text(row.get("location") or "")
+            flag = clean_text(row.get("flag") or location_flag(title if source == "hn" else location, cfg))
+            if source == "hn":
+                if drop.search(title) and not keep.search(title):
+                    continue
+            elif not title_ok(title, keep, drop):
+                continue
+            if key:
+                if key in seen:
+                    dropped += 1
+                    continue
+                seen.add(key)
+            same = [r for r, c in companies if company and _same_company_slug(company, c)]
+            status = "HOLD" if holding(same, days) else "SAMECO" if same else "NEW"
+            item = dict(source=source, company=company, title=title, location=location, flag=flag, url=url, status=status)
+            for field in ("age", "posted"):
+                if field in row:
+                    item[field] = row[field]
+            out.append(item)
+    def order(r):
+        freshness = float("inf")
+        try:
+            freshness = float(r["age"]) if "age" in r else (dt.date.fromisoformat(date) - dt.date.fromisoformat(r["posted"])).days
+        except (KeyError, ValueError, TypeError):
+            pass
+        return ("NEW SAMECO HOLD".split().index(r["status"]), bool(r["flag"]), freshness)
+    out.sort(key=order)
+    lines = ["The hold column and order are hints; every posting is still opened and checked with `seekter.py check` before a form (run skill §2.5). "
+             "HN rows were title-matched on the whole post by the sweep, so the queue only applies title_drop to their header.", "",
+             "| # | Status | Source | Company | Role | Location | Flag | Apply URL |", "|---|---|---|---|---|---|---|---|"]
+    for i, r in enumerate(out, 1):
+        cells = [_cell(clean_text(x)) for x in (i, r["status"], r["source"], r["company"], r["title"], r["location"], r["flag"],
+                 _md_url(r["url"]))]
+        for column in (3, 4, 5, 6):
+            cells[column] = _md_text(cells[column])
+        lines.append("| " + " | ".join(cells) + " |")
+    queue = outdir / "queue.md"
+    hand = ("## Added by hand\n\nLinkedIn, board and pasted-link candidates go here; "
+            "`seekter.py queue` keeps this section when it rebuilds the table above.\n")
+    if queue.exists():
+        with queue.open(encoding="utf-8", newline="") as f:
+            old = f.read()
+        heading = re.search(r"^## Added by hand(?:\r?\n|$)", old, re.M)
+        if heading:
+            hand = old[heading.start():]
+    _atomic_write(queue, "\n".join(lines) + "\n\n" + hand)
+    counts = {s: sum(r["status"] == s for r in out) for s in ("NEW", "SAMECO", "HOLD")}
+    print(f"queue: {len(out)} postings ({counts['NEW']} new, {counts['SAMECO']} same company, {counts['HOLD']} on hold), {dropped} already tracked or duplicate, {sum(bool(r['flag']) for r in out)} flagged, {blocked} blocked company → runs/{date}/queue.md")
+
+
 def cmd_add(a):
+    for field in ("company", "role", "url", "source", "remote_scope", "fit", "location_fit"):
+        setattr(a, field, clean_text(getattr(a, field)))
+    for field in ("why", "notes", "answers", "log"):
+        setattr(a, field, _clean_chars(getattr(a, field), body=True))
     if a.status not in STATUSES:
         sys.exit(f"status must be one of {STATUSES}")
     key = job_key(a.url or "")
@@ -658,6 +934,10 @@ def cmd_settings(a):
         print(json.dumps(clean(cfg), indent=1, ensure_ascii=False))
         return
     problems = []
+    for key in ("blocked_companies", "location_flags"):
+        value = cfg.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(x, str) or not x.strip() for x in value):
+            problems.append(f"{key} must be a list of non-empty strings")
     if cfg.get("linkedin", {}).get("mode") not in ("email", "read"):
         problems.append("linkedin.mode must be email or read")
     days = cfg.get("same_company_days")
@@ -747,16 +1027,17 @@ def cmd_normalize(a):
 
 def _link(r, base: Path):
     if r["_kind"] == "row":
-        return r.get("role", "")
-    return f"[{r.get('role','')}]({r['_path'].relative_to(base).as_posix()})"
+        return _md_text(r.get("role", ""))
+    role = _md_text(r.get("role", ""))
+    return f"[{role}]({r['_path'].relative_to(base).as_posix()})"
 
 
 def _table(rs, base, cols=("Date", "Company", "Role", "Status", "Fit", "Posting")):
     out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for r in rs:
-        vals = {"Date": r.get("applied") or r.get("updated", ""), "Company": _cell(r.get("company")),
-                "Role": _link(r, base), "Status": r.get("status", ""), "Fit": r.get("location_fit", ""),
-                "Posting": f"[link]({r['url']})" if r.get("url") else "",
+        vals = {"Date": r.get("applied") or r.get("updated", ""), "Company": _md_text(r.get("company")),
+                "Role": _link(r, base), "Status": _cell(r.get("status", "")), "Fit": _cell(r.get("location_fit", "")),
+                "Posting": f"[link]({_md_url(r['url'])})" if _md_url(r.get("url", "")) else "",
                 "Next step": _cell(section(r.get("_body", ""), "Notes"))[:160]}
         out.append("| " + " | ".join(vals[c] for c in cols) + " |")
     return out
@@ -787,11 +1068,11 @@ def cmd_index(a, quiet=False):
         files = [r for r in mr if r["_kind"] == "file"]
         ml += _table(files, d) if files else ["No applications this month."]
         ml += ["", f"Skipped postings ({c['skipped']}): [skipped.md](skipped.md)", ""]
-        (d / "README.md").write_text("\n".join(ml), encoding="utf-8")
+        _atomic_write(d / "README.md", "\n".join(ml))
     c, sent = counts(rs)
     lines += ["", f"All time: **{sent} sent** · " + " · ".join(f"{s} {c[s]}" for s in STATUSES if c[s]), ""]
     APPS.mkdir(exist_ok=True)
-    (APPS / "README.md").write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write(APPS / "README.md", "\n".join(lines))
     if not quiet:
         print(f"applications/README.md ({len(rs)} records, {len(month_dirs())} months)")
 
@@ -834,6 +1115,11 @@ def main():
     c = sp.add_parser("check"); c.add_argument("url"); c.add_argument("--company")
     c.set_defaults(fn=cmd_check)
     cm = sp.add_parser("check-many"); cm.set_defaults(fn=cmd_check_many)
+    ft = sp.add_parser("filter-test")
+    for option in ("titles", "date", "keep", "drop"):
+        ft.add_argument("--" + option)
+    ft.set_defaults(fn=cmd_filter_test)
+    qu = sp.add_parser("queue"); qu.add_argument("--date"); qu.set_defaults(fn=cmd_queue)
     ad = sp.add_parser("add")
     for f in ("company", "role", "url"):
         ad.add_argument("--" + f, required=f != "url", default="")

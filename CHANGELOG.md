@@ -4,6 +4,25 @@ The version is the git tag; there is no version file. Each release is also on
 [the releases page](https://github.com/selfishprimate/seekter/releases) with the
 same text.
 
+## Unreleased
+
+`seekter.py queue` turns the API sweeps into a deduped list for the apply half
+of a run, with title filters and same-company hold hints. Candidates added by
+hand survive the next rebuild; every posting still gets opened and checked
+before a form.
+
+The employer sweep now reads SmartRecruiters and Recruitee, and keeps posting
+dates from all six boards. Failed requests are reported, so an outage cannot
+quietly look like an empty market.
+
+`move` refuses paths outside the tracker. API text is cleaned before it reaches
+the terminal, table cells are escaped, and atomic writes keep file permissions.
+
+Setup now calibrates title filters against real postings before saving them;
+`filter-test` shows what falls on each side later. Sweeps record every dropped
+posting and its reason. Blocked companies stay out, while location phrases mark
+and demote postings for a closer read, keeping the decision open and auditable.
+
 ## v0.6.0 — 10 October 2026
 
 Doğan Can Karataş's second set of runs in Turkey (#45): a new application

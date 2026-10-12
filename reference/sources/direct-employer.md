@@ -1,5 +1,7 @@
 # Direct employer sources
 
+
+Blocked companies are excluded, location-flagged rows carry `flag` and are demoted rather than deleted, and dropped postings with their reasons are recorded in `runs/<date>/employers-dropped.json`.
 ## The watchlist: `python3 scripts/employer_sweep.py`
 
 Most product companies publish their job board as open JSON through their applicant tracking system. Reading it directly sees a posting the day it opens, with the employer's own location line, before any aggregator copies it and before LinkedIn shows it to everyone. No login, no browser, no terms to click.
@@ -16,6 +18,8 @@ The companies come from `employers` in `profile/settings.json`, one row per comp
 | `ashby` | `jobs.ashbyhq.com/<slug>` | `api.ashbyhq.com/posting-api/job-board/<slug>` |
 | `lever` | `jobs.lever.co/<slug>` (or `jobs.eu.lever.co`) | `api.lever.co/v0/postings/<slug>?mode=json`, then the EU host |
 | `workable` | `apply.workable.com/<slug>` | `apply.workable.com/api/v1/widget/accounts/<slug>` |
+| `smartrecruiters` | `jobs.smartrecruiters.com/<slug>` | `api.smartrecruiters.com/v1/companies/<slug>/postings?limit=100` |
+| `recruitee` | `<slug>.recruitee.com` | `<slug>.recruitee.com/api/offers/` |
 
 The script waits a second between boards, filters titles with the profile's `title_keep` / `title_drop`, drops anything already in the tracker, writes `runs/<date>/employers.json` and prints one line per candidate. A slug that returns nothing is printed as a `problem:` line rather than guessed at.
 
