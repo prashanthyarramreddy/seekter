@@ -202,14 +202,17 @@ def detail(which):
             idx.append(int(x))
     def fetch(i):
         result = curl("https://freehire.me/api/v1/jobs/" + urllib.parse.quote(cand[i]["slug"], safe=""))
-        return result, FETCH.failed
+        failed = FETCH.failed
+        if not isinstance(result, dict) or ("data" in result and not isinstance(result["data"], dict)):
+            return {}, True
+        return result.get("data", result), failed
     with cf.ThreadPoolExecutor(4) as ex:
         details = list(ex.map(fetch, idx))
     for i, (j, failed) in zip(idx, details):
         o = cand[i]
-        j = j.get("data", j)
-        d = html.unescape(re.sub(r"<[^>]+>", " ", j.get("description") or ""))
-        print(f"===== {i} | {o['company']} | {o['title']} | {seekter.clean_text(j.get('countries'))} {seekter.clean_text(j.get('regions'))}\n{o['url']}")
+        description = j.get("description")
+        d = html.unescape(re.sub(r"<[^>]+>", " ", description if isinstance(description, str) else ""))
+        print(f"===== {i} | {o['company']} | {o['title']} | {seekter.clean_text(j.get('countries') or '')} {seekter.clean_text(j.get('regions') or '')}\n{o['url']}")
         if failed:
             print("  - (fetch failed)")
             continue

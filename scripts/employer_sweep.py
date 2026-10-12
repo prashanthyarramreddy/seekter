@@ -49,7 +49,7 @@ def greenhouse(slug):
     d = curl(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs")
     if not isinstance(d, dict) or "jobs" not in d:
         return None
-    return [dict(title=j["title"], location=(j.get("location") or {}).get("name", ""),
+    return [dict(title=j["title"], location=(j.get("location") or {}).get("name") or "",
                  url=f"https://job-boards.greenhouse.io/{slug}/jobs/{j['id']}", **posted(j.get("updated_at"))) for j in d["jobs"]]
 
 
@@ -62,7 +62,7 @@ def ashby(slug):
         locs = [j.get("location") or ""] + [s.get("location", "") for s in j.get("secondaryLocations") or []]
         mode = j.get("workplaceType") or ""
         out.append(dict(title=j["title"], location=" / ".join(l for l in locs if l) + (f" ({mode})" if mode else ""),
-                        url=j["jobUrl"], **posted(j.get("publishedAt"))))
+                        url=j.get("jobUrl") or "", **posted(j.get("publishedAt"))))
     return out
 
 
@@ -70,8 +70,8 @@ def lever(slug):
     for host in ("api.lever.co", "api.eu.lever.co"):
         d = curl(f"https://{host}/v0/postings/{slug}?mode=json")
         if isinstance(d, list):
-            return [dict(title=j["text"], location=(j.get("categories") or {}).get("location", ""),
-                         url=j["hostedUrl"], **posted(j.get("createdAt"), milliseconds=True)) for j in d]
+            return [dict(title=j["text"], location=(j.get("categories") or {}).get("location") or "",
+                         url=j.get("hostedUrl") or "", **posted(j.get("createdAt"), milliseconds=True)) for j in d]
     return None
 
 
@@ -111,7 +111,7 @@ def recruitee(slug):
     if not isinstance(d, dict) or "offers" not in d:
         return None
     return [dict(title=j["title"], location=" ".join(x for x in (j.get("location") or " ".join(x for x in (j.get("city"), j.get("country")) if x), "remote" if j.get("remote") else "") if x),
-                 url=j["careers_url"], **posted(j.get("published_at"))) for j in d["offers"]]
+                 url=j.get("careers_url") or "", **posted(j.get("published_at"))) for j in d["offers"]]
 
 
 ATS = {"greenhouse": greenhouse, "ashby": ashby, "lever": lever, "workable": workable,
@@ -122,7 +122,7 @@ def employers():
     for key in ("blocked_companies", "location_flags"):
         CFG[key] = seekter._phrase_list(CFG, key)
     keep, drop = seekter.title_filters(CFG)
-    tracked = {r.get("job_key") for r in seekter.all_apps()}
+    tracked = {r.get("job_key") or seekter.job_key(r.get("url", "")) for r in seekter.all_apps()}
     watch = CFG.get("employers") or []
     if not watch:
         sys.exit("No employers in profile/settings.json yet. Add {name, ats, slug} rows "
@@ -143,8 +143,11 @@ def employers():
         else:
             seen += len(jobs)
             for j in jobs:
-                j = {k: seekter.clean_text(v) for k, v in j.items()}
+                j = {k: seekter.clean_text(v if v is not None else "") for k, v in j.items()}
                 co = seekter.clean_text(e.get("name") or "")
+                if not j["url"].startswith(("http://", "https://")):
+                    problems.append(f"{co}: a posting with no usable link was skipped ({j['title']})")
+                    continue
                 verdict, reason = seekter.screen(j["title"], co, j["location"], CFG, keep, drop)
                 if verdict != "skip" and seekter.job_key(j["url"]) in tracked:
                     verdict, reason = "skip", "tracked"

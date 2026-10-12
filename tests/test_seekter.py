@@ -269,6 +269,23 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(len(sk._split_row(row)), 6)
         self.assertEqual({p.name for p in path.parent.iterdir()}, {path.name, "README.md"})
 
+    def test_pending_notes_are_escaped_after_truncation_and_move_cleans_controls(self):
+        path = self.add(company="Acme", role="Designer", status="pending",
+                        url="https://example.com/notes",
+                        notes="[apply](javascript:x) <https://evil>")
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertNotRegex(index, r"(?<!\\)(?:\\\\)*\]\(javascript:")
+        self.assertNotIn("<https://evil>", index)
+        rc, _, err = self.run_cli("move", str(path), "interviewing", "--note", "Read\x1b[2J\nNext")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("\x1b", path.read_text())
+        self.assertIn("Read\nNext", path.read_text())
+        self.add(company="Long", role="Designer", status="pending",
+                 url="https://example.com/long-notes", notes="a" * 159 + "[tail]")
+        index = (self.tmp / "applications" / "README.md").read_text()
+        self.assertIn("a" * 159 + r"\[", index)
+        self.assertNotIn("tail", index)
+
     def test_role_backslash_cannot_unescape_link_text(self):
         self.add(company="Acme", role=r"x\](https://evil)", url="https://example.com/role")
         index = (self.tmp / "applications" / "README.md").read_text()
@@ -736,6 +753,17 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("DUPLICATE", out)
 
+    def test_add_refuses_tracked_url_without_front_matter_job_key(self):
+        url = "https://example.com/tracked-without-key"
+        path = self.add(company="Acme", role="Designer", url=url)
+        path.write_text("\n".join(line for line in path.read_text().splitlines()
+                                  if not line.startswith("job_key:")) + "\n")
+        before = path.read_text()
+        rc, _, err = self.run_cli("add", "--company", "Acme", "--role", "Designer", "--url", url)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("DUPLICATE", err)
+        self.assertEqual(path.read_text(), before)
+
     def test_add_refuses_a_duplicate_unless_forced(self):
         url = "https://acme.com/careers/1234567"
         self.add(company="Acme", role="Designer", url=url)
@@ -1093,6 +1121,28 @@ class FreehireSweepTests(unittest.TestCase):
         self.assertIn("problem: 1 of 2 detail requests failed; those entries show no eligibility lines", p.stdout)
         self.assertIn("  - Remote role", p.stdout)
 
+    def test_detail_handles_non_object_and_null_data_responses(self):
+        run = self.tmp / "runs" / TODAY
+        run.mkdir(parents=True)
+        (run / "freehire.json").write_text(json.dumps([
+            dict(slug=slug, company="Acme", title="Designer", url="https://example.com/" + slug)
+            for slug in ("array", "null", "number", "ok")]))
+        (self.tmp / "bin" / "curl").write_text(
+            '#!/bin/sh\nfor a in "$@"; do last="$a"; done\n'
+            'case "$last" in */array) echo \'[]\';; */null) echo \'{"data": null}\';; '
+            '*/number) echo \'{"data": {"description": 5}}\';; '
+            '*) echo \'{"data": {"description": "Remote role"}}\';; esac\n')
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "freehire_sweep.py"),
+                            "--detail", "all"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.count("(fetch failed)"), 2)
+        self.assertIn("problem: 2 of 4 detail requests failed; those entries show no eligibility lines", p.stdout)
+        self.assertIn("===== 3 | Acme | Designer", p.stdout)
+        self.assertIn("===== 2 | Acme | Designer", p.stdout)
+        self.assertNotIn("None None", p.stdout)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("  - Remote role", p.stdout)
+
     def test_a_home_country_without_regions_sweeps_by_country_only(self):
         # PR #39: freehire's own region for Turkey returns 0, so a home-country-only
         # candidate sets regions to [] and must still get the countries pass.
@@ -1255,6 +1305,43 @@ class EmployerSweepTests(unittest.TestCase):
         self.assertIn("Senior Product Designer", p.stdout)
         self.assertNotIn("Interior", p.stdout)
         self.assertNotIn("Growth", p.stdout)
+
+    def test_null_board_fields_and_unusable_links(self):
+        (self.tmp / "board.json").write_text(json.dumps(dict(jobs=[
+            dict(id=1, title="Designer", location=dict(name=None))])))
+        ashby = self.tmp / "ashby.json"
+        ashby.write_text(json.dumps(dict(jobs=[
+            dict(title="Null Designer", jobUrl=None),
+            dict(title="Unsafe Designer", jobUrl="javascript:x"),
+            dict(title="Valid Designer", jobUrl=" https://example.com/valid ")])))
+        (self.tmp / "bin" / "curl").write_text(
+            '#!/bin/sh\nfor a in "$@"; do last="$a"; done\n'
+            f'case "$last" in *greenhouse*) cat "{self.tmp / "board.json"}";; '
+            f'*) cat "{ashby}";; esac\n')
+        p = self.sweep([dict(name="Acme", ats=ats, slug="acme") for ats in ("greenhouse", "ashby")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads((self.tmp / "runs" / TODAY / "employers.json").read_text())
+        self.assertEqual([r["title"] for r in rows], ["Designer", "Valid Designer"])
+        self.assertEqual(rows[0]["location"], "")
+        self.assertEqual(rows[1]["url"], "https://example.com/valid")
+        self.assertNotIn("None", p.stdout)
+        for title in ("Null Designer", "Unsafe Designer"):
+            self.assertIn(f"problem: Acme: a posting with no usable link was skipped ({title})", p.stdout)
+
+    def test_tracked_url_without_front_matter_job_key_is_not_offered(self):
+        p = subprocess.run([sys.executable, str(self.tmp / "scripts" / "seekter.py"),
+                            "add", "--company", "Acme", "--role", "Designer", "--url",
+                            "https://job-boards.greenhouse.io/acme/jobs/1"],
+                           capture_output=True, text=True, check=True)
+        path = self.tmp / p.stdout.strip().splitlines()[0]
+        path.write_text("\n".join(line for line in path.read_text().splitlines()
+                                  if not line.startswith("job_key:")) + "\n")
+        p = self.sweep([dict(name="Acme", ats="greenhouse", slug="acme")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads((self.tmp / "runs" / TODAY / "employers.json").read_text())
+        self.assertEqual([r["title"] for r in rows], ["Product Designer, Growth"])
+        dropped = json.loads((self.tmp / "runs" / TODAY / "employers-dropped.json").read_text())
+        self.assertTrue(any(r["reason"] == "tracked" and r["url"].endswith("/1") for r in dropped))
 
     def test_a_wrong_slug_is_reported_not_guessed(self):
         p = self.sweep([{"name": "Nobody", "ats": "ashby", "slug": "nobody"},

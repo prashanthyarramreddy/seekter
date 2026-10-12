@@ -823,7 +823,7 @@ def cmd_add(a):
     key = job_key(a.url or "")
     if key and not a.force:
         for r in all_apps():
-            if r.get("job_key") == key:
+            if (r.get("job_key") or job_key(r.get("url", ""))) == key:
                 sys.exit(f"DUPLICATE: {label(r)} (use --force to add anyway)")
     today = a.date or TODAY
     meta = dict(company=a.company, role=a.role, status=a.status, url=a.url, source=a.source, ats=a.ats,
@@ -847,6 +847,7 @@ def cmd_move(a):
     r = find(a.target)
     if not r:
         sys.exit("not found")
+    a.note = _clean_chars(a.note, body=True)
     note = f"- {TODAY}: {a.status}" + (f". {a.note}" if a.note else "")
     if r["_kind"] == "row" and a.status == "skipped":
         if a.answers:
@@ -1038,7 +1039,7 @@ def _table(rs, base, cols=("Date", "Company", "Role", "Status", "Fit", "Posting"
         vals = {"Date": r.get("applied") or r.get("updated", ""), "Company": _md_text(r.get("company")),
                 "Role": _link(r, base), "Status": _cell(r.get("status", "")), "Fit": _cell(r.get("location_fit", "")),
                 "Posting": f"[link]({_md_url(r['url'])})" if _md_url(r.get("url", "")) else "",
-                "Next step": _cell(section(r.get("_body", ""), "Notes"))[:160]}
+                "Next step": _md_text(section(r.get("_body", ""), "Notes")[:160])}
         out.append("| " + " | ".join(vals[c] for c in cols) + " |")
     return out
 
